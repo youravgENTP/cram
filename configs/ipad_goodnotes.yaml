@@ -1,0 +1,20 @@
+video:
+  codec: h264_videotoolbox
+  fps: 30
+  bitrate: 1000k
+  keep_resolution: true
+
+audio:
+  codec: aac
+  bitrate: 96k
+
+output:
+  directory: compressed
+  suffix: _compressed
+  skip_existing: true
+  preserve_filename: true
+
+source:
+  extensions:
+    - .mp4
+    - .MP4

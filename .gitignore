@@ -1,0 +1,14 @@
+.state.json# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# cram runtime state
+.state.json
+
+# Generated video output
+compressed/
+
+# macOS
+.DS_Store
