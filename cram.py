@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TaskID,
+    TaskProgressColumn,
+    TextColumn,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -528,13 +535,15 @@ def calculate_eta(
         / speed_value
     )
 
-# FFmpeg 명령 실제 실행 및 진행률 표시
+# FFmpeg 명령 실제 실행 및 진행률 갱신
 def run_ffmpeg(
     command: list[str],
     output_path: Path,
     video_path: Path,
     index: int,
     total_videos: int,
+    progress: Progress,
+    task_id: TaskID,
 ) -> tuple[bool, str]:
     output_path.parent.mkdir(
         parents=True,
@@ -543,6 +552,23 @@ def run_ffmpeg(
 
     duration = get_video_duration(
         video_path
+    )
+
+    progress.update(
+        task_id,
+        total=duration,
+        completed=0,
+        visible=True,
+        description=(
+            f"[{index}/{total_videos}] "
+            f"{video_path.name}"
+        ),
+        current="00:00:00",
+        total_text=format_duration(
+            duration
+        ),
+        speed="--",
+        eta="--:--:--",
     )
 
     progress_command = (
@@ -573,7 +599,6 @@ def run_ffmpeg(
             )
 
         progress_data = {}
-        last_print_time = 0.0
 
         for raw_line in process.stdout:
             line = raw_line.strip()
@@ -591,35 +616,19 @@ def run_ffmpeg(
             if key != "progress":
                 continue
 
-            now = time.monotonic()
-
-            if (
-                value != "end"
-                and now - last_print_time < 5.0
-            ):
-                continue
-
-            out_time_seconds = parse_ffmpeg_time(
-                progress_data.get(
-                    "out_time",
-                    "00:00:00",
+            out_time_seconds = (
+                parse_ffmpeg_time(
+                    progress_data.get(
+                        "out_time",
+                        "00:00:00",
+                    )
                 )
             )
 
             speed = progress_data.get(
                 "speed",
-                "?"
+                "--",
             )
-
-            if duration > 0:
-                percent = min(
-                    out_time_seconds
-                    / duration
-                    * 100,
-                    100.0,
-                )
-            else:
-                percent = 0.0
 
             eta_seconds = calculate_eta(
                 duration=duration,
@@ -627,26 +636,23 @@ def run_ffmpeg(
                 speed=speed,
             )
 
-            print(
-                f"[{index}/{total_videos}] "
-                f"ENCODING "
-                f"{video_path.name}"
+            progress.update(
+                task_id,
+                completed=min(
+                    out_time_seconds,
+                    duration,
+                ),
+                current=format_duration(
+                    out_time_seconds
+                ),
+                total_text=format_duration(
+                    duration
+                ),
+                speed=speed,
+                eta=format_duration(
+                    eta_seconds
+                ),
             )
-
-            print(
-                f"      {percent:5.1f}%"
-                f" | {format_duration(out_time_seconds)}"
-                f" / {format_duration(duration)}"
-                f" | {speed}"
-                f" | ETA {format_duration(eta_seconds)}",
-                flush=True,
-            )
-
-            print(
-                flush=True,
-            )
-
-            last_print_time = now
 
         return_code = process.wait()
 
@@ -654,10 +660,37 @@ def run_ffmpeg(
         error_output = error_file.read()
 
     if return_code == 0:
+        progress.update(
+            task_id,
+            completed=duration,
+            description=(
+                f"[{index}/{total_videos}] "
+                f"DONE {video_path.name}"
+            ),
+            current=format_duration(
+                duration
+            ),
+            total_text=format_duration(
+                duration
+            ),
+            speed="done",
+            eta="00:00:00",
+        )
+
         return True, ""
 
     if output_path.exists():
         output_path.unlink()
+
+    progress.update(
+        task_id,
+        description=(
+            f"[{index}/{total_videos}] "
+            f"FAILED {video_path.name}"
+        ),
+        speed="failed",
+        eta="--:--:--",
+    )
 
     return False, error_output
 
@@ -863,73 +896,115 @@ def main() -> None:
 
     benchmark_start = time.perf_counter()
 
-    with ThreadPoolExecutor(
-        max_workers=workers,
-    ) as executor:
-        future_to_job = {}
+    failed_jobs = []
+
+    with Progress(
+        TextColumn(
+            "{task.description}"
+        ),
+        BarColumn(
+            bar_width=24,
+        ),
+        TaskProgressColumn(),
+        TextColumn(
+            "{task.fields[current]}"
+            " / "
+            "{task.fields[total_text]}"
+        ),
+        TextColumn(
+            "{task.fields[speed]}"
+        ),
+        TextColumn(
+            "ETA {task.fields[eta]}"
+        ),
+        refresh_per_second=4,
+    ) as progress:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+        ) as executor:
+            future_to_job = {}
+
+            for (
+                index,
+                video_path,
+                output_path,
+                command,
+            ) in jobs:
+                task_id = progress.add_task(
+                    (
+                        f"[{index}/{len(videos)}] "
+                        f"{video_path.name}"
+                    ),
+                    total=100,
+                    visible=False,
+                    current="00:00:00",
+                    total_text="--:--:--",
+                    speed="--",
+                    eta="--:--:--",
+                )
+
+                future = executor.submit(
+                    run_ffmpeg,
+                    command,
+                    output_path,
+                    video_path,
+                    index,
+                    len(videos),
+                    progress,
+                    task_id,
+                )
+
+                future_to_job[future] = (
+                    index,
+                    video_path,
+                    output_path,
+                )
+
+            for future in as_completed(
+                future_to_job
+            ):
+                (
+                    index,
+                    video_path,
+                    output_path,
+                ) = future_to_job[future]
+
+                success, error_output = (
+                    future.result()
+                )
+
+                if not success:
+                    failed_jobs.append(
+                        (
+                            video_path,
+                            error_output,
+                        )
+                    )
+
+    if failed_jobs:
+        print()
+        print("FFmpeg failures")
+        print()
 
         for (
-            index,
             video_path,
-            output_path,
-            command,
-        ) in jobs:
+            error_output,
+        ) in failed_jobs:
             print(
-                f"[{index}/{len(videos)}] "
-                f"START "
-                f"{video_path.name}"
+                f"FAILED: {video_path.name}"
             )
 
-            future = executor.submit(
-                run_ffmpeg,
-                command,
-                output_path,
-                video_path,
-                index,
-                len(videos),
-            )
-
-            future_to_job[future] = (
-                index,
-                video_path,
-                output_path,
-            )
-
-        for future in as_completed(future_to_job):
-            (
-                index,
-                video_path,
-                output_path,
-            ) = future_to_job[future]
-
-            success, error_output = future.result()
-
-            if success:
-                print(
-                    f"[{index}/{len(videos)}] "
-                    f"DONE "
-                    f"{video_path.name}"
-                )
-
-                print(
-                    f"  -> {output_path}"
-                )
-            else:
-                print(
-                    f"[{index}/{len(videos)}] "
-                    f"FAILED "
-                    f"{video_path.name}"
-                )
-
-                if error_output:
-                    print("  FFmpeg error:")
-
-                    for line in error_output.splitlines()[-10:]:
-                        print(
-                            f"    {line}"
-                        )
+            if error_output:
+                for line in (
+                    error_output
+                    .splitlines()[-10:]
+                ):
+                    print(
+                        f"  {line}"
+                    )
 
             print()
+
 
     elapsed_seconds = time.perf_counter() - benchmark_start
 
