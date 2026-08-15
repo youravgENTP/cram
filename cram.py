@@ -2,6 +2,10 @@ import argparse
 import json
 import shlex
 import subprocess
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+)
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +40,12 @@ def parse_args() -> argparse.Namespace:
         "--only",
         type=str,
         help="Process only the video with this exact filename.",
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Number of videos to encode concurrently.",
     )
 
     parser.add_argument(
@@ -201,6 +211,21 @@ def validate_config(config: dict[str, Any]) -> None:
             "video.fps must be a positive number"
         )
 
+    processing = config.get(
+        "processing",
+        {},
+    )
+
+    workers = processing.get(
+        "workers",
+        1,
+    )
+
+    if not isinstance(workers, int) or workers <= 0:
+        raise ValueError(
+            "processing.workers must be a positive integer"
+        )
+
 # 디렉토리 내 영상탐색 함수
 def discover_videos(
     input_directory: Path,
@@ -277,34 +302,57 @@ def build_ffmpeg_command(
 
     return command
 
+# CLI 또는 config에서 worker 수 결정
+def resolve_workers(
+    cli_workers: Optional[int],
+    config: dict[str, Any],
+) -> int:
+    if cli_workers is not None:
+        workers = cli_workers
+    else:
+        processing = config.get(
+            "processing",
+            {},
+        )
+
+        workers = processing.get(
+            "workers",
+            1,
+        )
+
+    if not isinstance(workers, int) or workers <= 0:
+        raise ValueError(
+            "workers must be a positive integer"
+        )
+
+    return workers
+
 # FFmpeg 명령 실제 실행
 def run_ffmpeg(
     command: list[str],
     output_path: Path,
-) -> bool:
+) -> tuple[bool, str]:
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    try:
-        result = subprocess.run(
-            command,
-            check=False,
-        )
-    except KeyboardInterrupt:
-        if output_path.exists():
-            output_path.unlink()
-
-        raise
+    result = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
 
     if result.returncode == 0:
-        return True
+        return True, ""
 
     if output_path.exists():
         output_path.unlink()
 
-    return False
+    return False, result.stderr
+
 
 def print_config(
     config_path: Path,
@@ -387,14 +435,24 @@ def main() -> None:
                 f"Video not found in input directory: {args.only}"
             )
 
+    workers = resolve_workers(
+        cli_workers=args.workers,
+        config=config,
+    )
+
     print_config(
         config_path=config_path,
         input_directory=input_directory,
         config=config,
     )
 
+    print(f"Workers")
+    print(f"  {workers}")
+    print()
     print(f"Found {len(videos)} video file(s).")
     print()
+
+    jobs = []
 
     for index, video_path in enumerate(videos, start=1):
         output_path = build_output_path(
@@ -444,28 +502,93 @@ def main() -> None:
 
             continue
 
-        print(
-            f"[{index}/{len(videos)}] "
-            f"ENCODING "
-            f"{video_path.name}"
+        jobs.append(
+            (
+                index,
+                video_path,
+                output_path,
+                command,
+            )
         )
 
-        print(
-            f"  -> {output_path}"
-        )
+    if not args.execute:
+        return
 
-        success = run_ffmpeg(
-            command=command,
-            output_path=output_path,
-        )
+    if not jobs:
+        print("No videos to encode.")
+        return
 
-        if success:
-            print("  DONE")
-        else:
-            print("  FAILED")
+    print()
+    print(
+        f"Starting {len(jobs)} encoding job(s) "
+        f"with {workers} worker(s)."
+    )
+    print()
 
-        print()
+    with ThreadPoolExecutor(
+        max_workers=workers,
+    ) as executor:
+        future_to_job = {}
 
+        for (
+            index,
+            video_path,
+            output_path,
+            command,
+        ) in jobs:
+            print(
+                f"[{index}/{len(videos)}] "
+                f"START "
+                f"{video_path.name}"
+            )
+
+            future = executor.submit(
+                run_ffmpeg,
+                command,
+                output_path,
+            )
+
+            future_to_job[future] = (
+                index,
+                video_path,
+                output_path,
+            )
+
+        for future in as_completed(future_to_job):
+            (
+                index,
+                video_path,
+                output_path,
+            ) = future_to_job[future]
+
+            success, error_output = future.result()
+
+            if success:
+                print(
+                    f"[{index}/{len(videos)}] "
+                    f"DONE "
+                    f"{video_path.name}"
+                )
+
+                print(
+                    f"  -> {output_path}"
+                )
+            else:
+                print(
+                    f"[{index}/{len(videos)}] "
+                    f"FAILED "
+                    f"{video_path.name}"
+                )
+
+                if error_output:
+                    print("  FFmpeg error:")
+
+                    for line in error_output.splitlines()[-10:]:
+                        print(
+                            f"    {line}"
+                        )
+
+            print()
 
 if __name__ == "__main__":
     main()
