@@ -1,9 +1,9 @@
-from __future__ import annotations
-
 import argparse
 import json
+import shlex
+import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -30,6 +30,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path.cwd(),
         help="Input directory. Defaults to the current working directory.",
+    )
+
+    parser.add_argument(
+        "--only",
+        type=str,
+        help="Process only the video with this exact filename.",
+    )
+
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Run FFmpeg. Without this flag, cram performs a dry run.",
     )
 
     return parser.parse_args()
@@ -62,7 +74,7 @@ def save_state(config_path: Path) -> None:
 
 
 def resolve_config_path(
-    cli_config: Path | None,
+    cli_config: Optional[Path],
     state: dict[str, Any],
 ) -> Path:
     if cli_config is not None:
@@ -265,6 +277,35 @@ def build_ffmpeg_command(
 
     return command
 
+# FFmpeg 명령 실제 실행
+def run_ffmpeg(
+    command: list[str],
+    output_path: Path,
+) -> bool:
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+        )
+    except KeyboardInterrupt:
+        if output_path.exists():
+            output_path.unlink()
+
+        raise
+
+    if result.returncode == 0:
+        return True
+
+    if output_path.exists():
+        output_path.unlink()
+
+    return False
+
 def print_config(
     config_path: Path,
     input_directory: Path,
@@ -334,6 +375,18 @@ def main() -> None:
         config=config,
     )
 
+    if args.only is not None:
+        videos = [
+            video
+            for video in videos
+            if video.name == args.only
+        ]
+
+        if not videos:
+            raise FileNotFoundError(
+                f"Video not found in input directory: {args.only}"
+            )
+
     print_config(
         config_path=config_path,
         input_directory=input_directory,
@@ -355,23 +408,17 @@ def main() -> None:
             and output_path.exists()
         )
 
-        status = (
-            "SKIP"
-            if should_skip
-            else "READY"
-        )
-
-        print(
-            f"[{index}/{len(videos)}] "
-            f"{status} "
-            f"{video_path.name}"
-        )
-
-        print(
-            f"  -> {output_path}"
-        )
-
         if should_skip:
+            print(
+                f"[{index}/{len(videos)}] "
+                f"SKIP "
+                f"{video_path.name}"
+            )
+
+            print(
+                f"  -> {output_path}"
+            )
+
             continue
 
         command = build_ffmpeg_command(
@@ -380,19 +427,44 @@ def main() -> None:
             config=config,
         )
 
+        if not args.execute:
+            print(
+                f"[{index}/{len(videos)}] "
+                f"READY "
+                f"{video_path.name}"
+            )
+
+            print(
+                f"  -> {output_path}"
+            )
+
+            print(
+                f"  ffmpeg: {shlex.join(command)}"
+            )
+
+            continue
+
         print(
-            "  ffmpeg:"
+            f"[{index}/{len(videos)}] "
+            f"ENCODING "
+            f"{video_path.name}"
         )
 
         print(
-            "    "
-            + " ".join(
-                f'"{argument}"'
-                if " " in argument
-                else argument
-                for argument in command
-            )
+            f"  -> {output_path}"
         )
+
+        success = run_ffmpeg(
+            command=command,
+            output_path=output_path,
+        )
+
+        if success:
+            print("  DONE")
+        else:
+            print("  FAILED")
+
+        print()
 
 
 if __name__ == "__main__":
