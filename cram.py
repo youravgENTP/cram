@@ -213,6 +213,58 @@ def discover_videos(
     )
 
 
+# 원본 영상에 대응하는 출력 파일 경로 계산
+def build_output_path(
+    video_path: Path,
+    input_directory: Path,
+    config: dict[str, Any],
+) -> Path:
+    output = config["output"]
+
+    output_directory = (
+        input_directory
+        / output["directory"]
+    )
+
+    suffix = output["suffix"]
+
+    output_filename = (
+        f"{video_path.stem}"
+        f"{suffix}"
+        f"{video_path.suffix.lower()}"
+    )
+
+    return output_directory / output_filename
+
+# config를 바탕으로 FFmpeg 명령 생성
+def build_ffmpeg_command(
+    video_path: Path,
+    output_path: Path,
+    config: dict[str, Any],
+) -> list[str]:
+    video = config["video"]
+    audio = config["audio"]
+
+    command = [
+        "ffmpeg",
+        "-noautorotate",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"fps={video['fps']}",
+        "-c:v",
+        str(video["codec"]),
+        "-b:v",
+        str(video["bitrate"]),
+        "-c:a",
+        str(audio["codec"]),
+        "-b:a",
+        str(audio["bitrate"]),
+        str(output_path),
+    ]
+
+    return command
+
 def print_config(
     config_path: Path,
     input_directory: Path,
@@ -292,9 +344,54 @@ def main() -> None:
     print()
 
     for index, video_path in enumerate(videos, start=1):
+        output_path = build_output_path(
+            video_path=video_path,
+            input_directory=input_directory,
+            config=config,
+        )
+
+        should_skip = (
+            config["output"]["skip_existing"]
+            and output_path.exists()
+        )
+
+        status = (
+            "SKIP"
+            if should_skip
+            else "READY"
+        )
+
         print(
             f"[{index}/{len(videos)}] "
+            f"{status} "
             f"{video_path.name}"
+        )
+
+        print(
+            f"  -> {output_path}"
+        )
+
+        if should_skip:
+            continue
+
+        command = build_ffmpeg_command(
+            video_path=video_path,
+            output_path=output_path,
+            config=config,
+        )
+
+        print(
+            "  ffmpeg:"
+        )
+
+        print(
+            "    "
+            + " ".join(
+                f'"{argument}"'
+                if " " in argument
+                else argument
+                for argument in command
+            )
         )
 
 
