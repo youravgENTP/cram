@@ -3,6 +3,7 @@ import csv
 import json
 import shlex
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 from concurrent.futures import (
@@ -421,31 +422,244 @@ def resolve_workers(
 
     return workers
 
-# FFmpeg 명령 실제 실행
+
+# ffprobe를 이용해 영상 길이 확인
+def get_video_duration(
+    video_path: Path,
+) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffprobe failed: {video_path}"
+        )
+
+    return float(
+        result.stdout.strip()
+    )
+
+
+# FFmpeg HH:MM:SS 문자열을 초 단위로 변환
+def parse_ffmpeg_time(
+    value: str,
+) -> float:
+    parts = value.split(":")
+
+    if len(parts) != 3:
+        return 0.0
+
+    hours = float(parts[0])
+    minutes = float(parts[1])
+    seconds = float(parts[2])
+
+    return (
+        hours * 3600
+        + minutes * 60
+        + seconds
+    )
+
+
+# 초 단위를 HH:MM:SS 문자열로 변환
+def format_duration(
+    seconds: float,
+) -> str:
+    if seconds < 0:
+        seconds = 0
+
+    total_seconds = int(
+        round(seconds)
+    )
+
+    hours, remainder = divmod(
+        total_seconds,
+        3600,
+    )
+
+    minutes, seconds = divmod(
+        remainder,
+        60,
+    )
+
+    return (
+        f"{hours:02d}:"
+        f"{minutes:02d}:"
+        f"{seconds:02d}"
+    )
+
+
+# 현재 FFmpeg speed를 이용해 남은 시간 계산
+def calculate_eta(
+    duration: float,
+    current_time: float,
+    speed: str,
+) -> float:
+    try:
+        speed_value = float(
+            speed.rstrip("x")
+        )
+    except ValueError:
+        return 0.0
+
+    if speed_value <= 0:
+        return 0.0
+
+    remaining_video_time = max(
+        duration - current_time,
+        0.0,
+    )
+
+    return (
+        remaining_video_time
+        / speed_value
+    )
+
+# FFmpeg 명령 실제 실행 및 진행률 표시
 def run_ffmpeg(
     command: list[str],
     output_path: Path,
+    video_path: Path,
+    index: int,
+    total_videos: int,
 ) -> tuple[bool, str]:
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    result = subprocess.run(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
+    duration = get_video_duration(
+        video_path
     )
 
-    if result.returncode == 0:
+    progress_command = (
+        command[:-1]
+        + [
+            "-progress",
+            "pipe:1",
+            "-nostats",
+        ]
+        + [command[-1]]
+    )
+
+    with tempfile.TemporaryFile(
+        mode="w+",
+        encoding="utf-8",
+    ) as error_file:
+        process = subprocess.Popen(
+            progress_command,
+            stdout=subprocess.PIPE,
+            stderr=error_file,
+            text=True,
+            bufsize=1,
+        )
+
+        if process.stdout is None:
+            raise RuntimeError(
+                "Failed to open FFmpeg progress stream"
+            )
+
+        progress_data = {}
+        last_print_time = 0.0
+
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split(
+                "=",
+                1,
+            )
+
+            progress_data[key] = value
+
+            if key != "progress":
+                continue
+
+            now = time.monotonic()
+
+            if (
+                value != "end"
+                and now - last_print_time < 5.0
+            ):
+                continue
+
+            out_time_seconds = parse_ffmpeg_time(
+                progress_data.get(
+                    "out_time",
+                    "00:00:00",
+                )
+            )
+
+            speed = progress_data.get(
+                "speed",
+                "?"
+            )
+
+            if duration > 0:
+                percent = min(
+                    out_time_seconds
+                    / duration
+                    * 100,
+                    100.0,
+                )
+            else:
+                percent = 0.0
+
+            eta_seconds = calculate_eta(
+                duration=duration,
+                current_time=out_time_seconds,
+                speed=speed,
+            )
+
+            print(
+                f"[{index}/{total_videos}] "
+                f"ENCODING "
+                f"{video_path.name}"
+            )
+
+            print(
+                f"      {percent:5.1f}%"
+                f" | {format_duration(out_time_seconds)}"
+                f" / {format_duration(duration)}"
+                f" | {speed}"
+                f" | ETA {format_duration(eta_seconds)}",
+                flush=True,
+            )
+
+            print(
+                flush=True,
+            )
+
+            last_print_time = now
+
+        return_code = process.wait()
+
+        error_file.seek(0)
+        error_output = error_file.read()
+
+    if return_code == 0:
         return True, ""
 
     if output_path.exists():
         output_path.unlink()
 
-    return False, result.stderr
+    return False, error_output
 
 
 def print_config(
@@ -670,6 +884,9 @@ def main() -> None:
                 run_ffmpeg,
                 command,
                 output_path,
+                video_path,
+                index,
+                len(videos),
             )
 
             future_to_job[future] = (
