@@ -1,7 +1,10 @@
 import argparse
+import csv
 import json
 import shlex
 import subprocess
+import time
+from datetime import datetime
 from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
@@ -15,7 +18,11 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATE_FILE = PROJECT_ROOT / ".state.json"
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "ipad_goodnotes.yaml"
-
+BENCHMARK_CSV = (
+    PROJECT_ROOT
+    / "experiments"
+    / "benchmark_results.csv"
+)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -46,6 +53,15 @@ def parse_args() -> argparse.Namespace:
         "--workers",
         type=int,
         help="Number of videos to encode concurrently.",
+    )
+
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        help=(
+            "Record this execution as a benchmark "
+            "with the given experiment ID."
+        ),
     )
 
     parser.add_argument(
@@ -302,6 +318,84 @@ def build_ffmpeg_command(
 
     return command
 
+# 파일 크기를 MB 단위로 반환
+def get_file_size_mb(path: Path) -> float:
+    return path.stat().st_size / (1024 * 1024)
+
+
+# benchmark 결과를 CSV에 기록
+def append_benchmark_result(
+    experiment_id: str,
+    input_directory: Path,
+    config_path: Path,
+    config: dict[str, Any],
+    workers: int,
+    file_count: int,
+    total_input_mb: float,
+    total_output_mb: float,
+    elapsed_seconds: float,
+    space_saved_percent: float,
+    result: str,
+) -> None:
+    video = config["video"]
+    audio = config["audio"]
+
+    row = {
+        "experiment_id": experiment_id,
+        "date": datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        ),
+        "input_set": input_directory.name,
+        "config": config_path.name,
+        "workers": workers,
+        "video_codec": video["codec"],
+        "video_bitrate": video["bitrate"],
+        "fps": video["fps"],
+        "audio_bitrate": audio["bitrate"],
+        "file_count": file_count,
+        "total_input_mb": f"{total_input_mb:.2f}",
+        "total_output_mb": f"{total_output_mb:.2f}",
+        "elapsed_seconds": f"{elapsed_seconds:.2f}",
+        "throughput_x": "",
+        "space_saved_percent": (
+            f"{space_saved_percent:.2f}"
+        ),
+        "result": result,
+        "notes": "",
+    }
+
+    fieldnames = [
+        "experiment_id",
+        "date",
+        "input_set",
+        "config",
+        "workers",
+        "video_codec",
+        "video_bitrate",
+        "fps",
+        "audio_bitrate",
+        "file_count",
+        "total_input_mb",
+        "total_output_mb",
+        "elapsed_seconds",
+        "throughput_x",
+        "space_saved_percent",
+        "result",
+        "notes",
+    ]
+
+    with BENCHMARK_CSV.open(
+        "a",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+        )
+
+        writer.writerow(row)
+
 # CLI 또는 config에서 worker 수 결정
 def resolve_workers(
     cli_workers: Optional[int],
@@ -440,6 +534,34 @@ def main() -> None:
         config=config,
     )
 
+    if args.benchmark is not None:
+        if not args.execute:
+            raise ValueError(
+                "--benchmark requires --execute"
+            )
+
+        existing_outputs = [
+            build_output_path(
+                video_path=video_path,
+                input_directory=input_directory,
+                config=config,
+            )
+            for video_path in videos
+            if build_output_path(
+                video_path=video_path,
+                input_directory=input_directory,
+                config=config,
+            ).exists()
+        ]
+
+        if existing_outputs:
+            raise FileExistsError(
+                "Benchmark aborted because existing "
+                "compressed output files were found. "
+                "Remove the output directory before "
+                "running a benchmark."
+            )
+
     print_config(
         config_path=config_path,
         input_directory=input_directory,
@@ -525,6 +647,8 @@ def main() -> None:
     )
     print()
 
+    benchmark_start = time.perf_counter()
+
     with ThreadPoolExecutor(
         max_workers=workers,
     ) as executor:
@@ -589,6 +713,87 @@ def main() -> None:
                         )
 
             print()
+
+    elapsed_seconds = time.perf_counter() - benchmark_start
+
+    if args.benchmark is not None:
+        successful_outputs = [
+            build_output_path(
+                video_path=video_path,
+                input_directory=input_directory,
+                config=config,
+            )
+            for video_path in videos
+            if build_output_path(
+                video_path=video_path,
+                input_directory=input_directory,
+                config=config,
+            ).exists()
+        ]
+
+        total_input_mb = sum(
+            get_file_size_mb(video_path)
+            for video_path in videos
+        )
+
+        total_output_mb = sum(
+            get_file_size_mb(output_path)
+            for output_path in successful_outputs
+        )
+
+        failed_count = (
+            len(videos)
+            - len(successful_outputs)
+        )
+
+        if failed_count == 0:
+            result = "success"
+        elif successful_outputs:
+            result = "partial"
+        else:
+            result = "failed"
+
+        if total_input_mb > 0:
+            space_saved_percent = (
+                (
+                    total_input_mb
+                    - total_output_mb
+                )
+                / total_input_mb
+                * 100
+            )
+        else:
+            space_saved_percent = 0.0
+
+        append_benchmark_result(
+            experiment_id=args.benchmark,
+            input_directory=input_directory,
+            config_path=config_path,
+            config=config,
+            workers=workers,
+            file_count=len(videos),
+            total_input_mb=total_input_mb,
+            total_output_mb=total_output_mb,
+            elapsed_seconds=elapsed_seconds,
+            space_saved_percent=space_saved_percent,
+            result=result,
+        )
+
+        print("Benchmark")
+        print()
+        print(f"  ID:       {args.benchmark}")
+        print(f"  Workers:  {workers}")
+        print(f"  Files:    {len(videos)}")
+        print(f"  Elapsed:  {elapsed_seconds:.1f} s")
+        print(f"  Input:    {total_input_mb:.1f} MB")
+        print(f"  Output:   {total_output_mb:.1f} MB")
+        print(f"  Saved:    {space_saved_percent:.1f}%")
+        print(f"  Result:   {result.upper()}")
+        print()
+        print(
+            "Recorded:"
+            f"  {BENCHMARK_CSV}"
+        )
 
 if __name__ == "__main__":
     main()
