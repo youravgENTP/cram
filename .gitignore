@@ -12,3 +12,6 @@ compressed/
 
 # macOS
 .DS_Store
+
+# Local notification settings
+notifications/*.local.json

@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -8,11 +9,43 @@ from urllib.request import Request, urlopen
 
 DEFAULT_SERVER = "https://ntfy.sh"
 DEFAULT_TITLE = "cram"
+LOCAL_CONFIG_PATH = (
+    Path(__file__).resolve().parent
+    / "ntfy.local.json"
+)
 
 
 class NtfyError(RuntimeError):
     """Raised when an ntfy notification cannot be sent."""
 
+
+def load_local_config() -> dict:
+    if not LOCAL_CONFIG_PATH.exists():
+        return {}
+
+    try:
+        with LOCAL_CONFIG_PATH.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            config = json.load(file)
+
+    except (
+        OSError,
+        json.JSONDecodeError,
+    ) as error:
+        raise NtfyError(
+            "Could not read local ntfy config: "
+            f"{error}"
+        ) from error
+
+    if not isinstance(config, dict):
+        raise NtfyError(
+            "ntfy.local.json must contain "
+            "a JSON object."
+        )
+
+    return config
 
 def send_ntfy(
     message: str,
@@ -24,19 +57,25 @@ def send_ntfy(
     server: Optional[str] = None,
     timeout: float = 10.0,
 ) -> None:
+    local_config = load_local_config()
+
     resolved_topic = (
         topic
         or os.environ.get("NTFY_TOPIC")
+        or local_config.get("topic")
     )
 
     if not resolved_topic:
         raise NtfyError(
-            "NTFY_TOPIC is not configured."
+            "ntfy topic is not configured. "
+            "Set NTFY_TOPIC or create "
+            "notifications/ntfy.local.json."
         )
 
     resolved_server = (
         server
         or os.environ.get("NTFY_SERVER")
+        or local_config.get("server")
         or DEFAULT_SERVER
     ).rstrip("/")
 
