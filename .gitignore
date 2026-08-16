@@ -15,3 +15,6 @@ compressed/
 
 # Local notification settings
 notifications/*.local.json
+
+# Runtime logs
+logs/

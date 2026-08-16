@@ -27,6 +27,8 @@ from notifications.ntfy import (
     send_ntfy,
 )
 
+from runtime_logs import RuntimeLogger
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATE_FILE = PROJECT_ROOT / ".state.json"
@@ -337,6 +339,14 @@ def build_ffmpeg_command(
 
     return command
 
+def get_file_size_bytes(
+    path: Path,
+) -> Optional[int]:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
 # 파일 크기를 MB 단위로 반환
 def get_file_size_mb(path: Path) -> float:
     return path.stat().st_size / (1024 * 1024)
@@ -440,6 +450,66 @@ def resolve_workers(
 
     return workers
 
+
+# ffprobe를 이용해 영상 파일 유효성 확인
+def probe_video(
+    video_path: Path,
+) -> tuple[
+    bool,
+    Optional[float],
+    str,
+]:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            (
+                "default="
+                "noprint_wrappers=1:"
+                "nokey=1"
+            ),
+            str(video_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        return (
+            False,
+            None,
+            result.stderr.strip(),
+        )
+
+    try:
+        duration = float(
+            result.stdout.strip()
+        )
+    except ValueError:
+        return (
+            False,
+            None,
+            "Invalid duration returned by ffprobe",
+        )
+
+    if duration <= 0:
+        return (
+            False,
+            duration,
+            "Video duration is not positive",
+        )
+
+    return (
+        True,
+        duration,
+        "",
+    )
 
 # ffprobe를 이용해 영상 길이 확인
 def get_video_duration(
@@ -555,11 +625,12 @@ def run_ffmpeg(
     total_videos: int,
     progress: Progress,
     task_id: TaskID,
-) -> tuple[bool, str]:
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+) -> tuple[
+    bool,
+    str,
+    float,
+    float,
+]:
 
     duration = get_video_duration(
         video_path
@@ -596,6 +667,8 @@ def run_ffmpeg(
         mode="w+",
         encoding="utf-8",
     ) as error_file:
+        encode_start = time.perf_counter()
+
         process = subprocess.Popen(
             progress_command,
             stdout=subprocess.PIPE,
@@ -667,6 +740,15 @@ def run_ffmpeg(
 
         return_code = process.wait()
 
+        return_code = process.wait()
+
+        encode_elapsed = (
+            time.perf_counter()
+            - encode_start
+        )
+
+        error_file.seek(0)
+
         error_file.seek(0)
         error_output = error_file.read()
 
@@ -688,7 +770,12 @@ def run_ffmpeg(
             eta="00:00:00",
         )
 
-        return True, ""
+        return (
+            True,
+            "",
+            duration,
+            encode_elapsed,
+        )
 
     if output_path.exists():
         output_path.unlink()
@@ -703,7 +790,12 @@ def run_ffmpeg(
         eta="--:--:--",
     )
 
-    return False, error_output
+    return (
+        False,
+        error_output,
+        duration,
+        encode_elapsed,
+    )
 
 
 def print_config(
@@ -792,6 +884,36 @@ def main() -> None:
         config=config,
     )
 
+    runtime_logger = RuntimeLogger()
+
+    run_start_time = (
+        time.perf_counter()
+    )
+
+    if args.execute:
+        runtime_logger.event(
+            "run_start",
+            input_directory=(
+                str(input_directory)
+            ),
+            config=str(config_path),
+            workers=workers,
+            video_codec=(
+                config["video"]["codec"]
+            ),
+            video_bitrate=(
+                config["video"]["bitrate"]
+            ),
+            fps=config["video"]["fps"],
+            audio_codec=(
+                config["audio"]["codec"]
+            ),
+            audio_bitrate=(
+                config["audio"]["bitrate"]
+            ),
+            discovered_files=len(videos),
+        )
+
     if args.benchmark is not None:
         if not args.execute:
             raise ValueError(
@@ -841,10 +963,89 @@ def main() -> None:
             config=config,
         )
 
-        should_skip = (
+        should_skip = False
+
+        if (
             config["output"]["skip_existing"]
             and output_path.exists()
-        )
+        ):
+            (
+                output_valid,
+                output_duration,
+                probe_error,
+            ) = probe_video(
+                output_path
+            )
+
+            if output_valid:
+                should_skip = True
+
+                runtime_logger.event(
+                    "file_skip",
+                    input_file=str(video_path),
+                    output_file=str(output_path),
+                    reason=(
+                        "valid_existing_output"
+                    ),
+                    output_duration_seconds=(
+                        output_duration
+                    ),
+                    output_bytes=(
+                        get_file_size_bytes(
+                            output_path
+                        )
+                    ),
+                )
+
+            else:
+                print(
+                    f"[{index}/{len(videos)}] "
+                    f"INVALID "
+                    f"{output_path.name}"
+                )
+
+                print(
+                    "  -> existing output "
+                    "will be re-encoded"
+                )
+
+                runtime_logger.event(
+                    "file_invalid",
+                    input_file=str(video_path),
+                    output_file=str(output_path),
+                    reason=probe_error,
+                    output_bytes=(
+                        get_file_size_bytes(
+                            output_path
+                        )
+                    ),
+                )
+
+                if args.execute:
+                    try:
+                        output_path.unlink()
+
+                        runtime_logger.event(
+                            "file_invalid_removed",
+                            output_file=(
+                                str(output_path)
+                            ),
+                        )
+
+                    except OSError as error:
+                        runtime_logger.event(
+                            "file_remove_failed",
+                            output_file=(
+                                str(output_path)
+                            ),
+                            error=str(error),
+                        )
+
+                        raise RuntimeError(
+                            "Could not remove "
+                            "invalid output: "
+                            f"{output_path}"
+                        ) from error
 
         if should_skip:
             print(
@@ -896,6 +1097,19 @@ def main() -> None:
 
     if not jobs:
         print("No videos to encode.")
+
+        runtime_logger.event(
+            "run_complete",
+            status="nothing_to_encode",
+            discovered_files=len(videos),
+            encoded_files=0,
+            failed_files=0,
+            elapsed_seconds=(
+                time.perf_counter()
+                - run_start_time
+            ),
+        )
+
         return
 
     print()
@@ -980,16 +1194,75 @@ def main() -> None:
                     output_path,
                 ) = future_to_job[future]
 
-                success, error_output = (
-                    future.result()
-                )
+                try:
+                    (
+                        success,
+                        error_output,
+                        duration,
+                        file_elapsed,
+                    ) = future.result()
 
-                if not success:
+                except Exception as error:
+                    success = False
+                    error_output = str(error)
+                    duration = 0.0
+                    file_elapsed = 0.0
+
+                if success:
+                    average_speed = (
+                        duration / file_elapsed
+                        if file_elapsed > 0
+                        else 0.0
+                    )
+
+                    runtime_logger.event(
+                        "file_complete",
+                        input_file=(
+                            str(video_path)
+                        ),
+                        output_file=(
+                            str(output_path)
+                        ),
+                        input_bytes=(
+                            get_file_size_bytes(
+                                video_path
+                            )
+                        ),
+                        output_bytes=(
+                            get_file_size_bytes(
+                                output_path
+                            )
+                        ),
+                        duration_seconds=duration,
+                        elapsed_seconds=(
+                            file_elapsed
+                        ),
+                        average_speed_x=(
+                            average_speed
+                        ),
+                    )
+
+                else:
                     failed_jobs.append(
                         (
                             video_path,
                             error_output,
                         )
+                    )
+
+                    runtime_logger.event(
+                        "file_failed",
+                        input_file=(
+                            str(video_path)
+                        ),
+                        output_file=(
+                            str(output_path)
+                        ),
+                        duration_seconds=duration,
+                        elapsed_seconds=(
+                            file_elapsed
+                        ),
+                        error=error_output,
                     )
 
     if failed_jobs:
@@ -1046,6 +1319,30 @@ def main() -> None:
 
 
     elapsed_seconds = time.perf_counter() - benchmark_start
+
+    total_run_elapsed = (
+        time.perf_counter()
+        - run_start_time
+    )
+
+    runtime_logger.event(
+        "run_complete",
+        status=(
+            "success"
+            if not failed_jobs
+            else "partial_failure"
+        ),
+        discovered_files=len(videos),
+        encoded_files=(
+            len(jobs)
+            - len(failed_jobs)
+        ),
+        failed_files=len(failed_jobs),
+        workers=workers,
+        elapsed_seconds=(
+            total_run_elapsed
+        ),
+    )
 
     if args.benchmark is not None:
         successful_outputs = [
