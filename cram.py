@@ -740,8 +740,6 @@ def run_ffmpeg(
 
         return_code = process.wait()
 
-        return_code = process.wait()
-
         encode_elapsed = (
             time.perf_counter()
             - encode_start
@@ -1311,7 +1309,18 @@ def main() -> None:
                     tags=["white_check_mark"],
                 )
 
+            runtime_logger.event(
+                "notification_sent",
+                provider="ntfy",
+            )
+
         except NtfyError as error:
+            runtime_logger.event(
+                "notification_failed",
+                provider="ntfy",
+                error=str(error),
+            )
+
             print()
             print(
                 f"Notification failed: {error}"
