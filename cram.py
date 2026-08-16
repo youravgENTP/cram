@@ -22,6 +22,11 @@ from rich.progress import (
     TextColumn,
 )
 
+from notifications.ntfy import (
+    NtfyError,
+    send_ntfy,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATE_FILE = PROJECT_ROOT / ".state.json"
@@ -76,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         "--execute",
         action="store_true",
         help="Run FFmpeg. Without this flag, cram performs a dry run.",
+    )
+
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send an ntfy notification when encoding finishes.",
     )
 
     return parser.parse_args()
@@ -1004,6 +1015,34 @@ def main() -> None:
                     )
 
             print()
+
+    if args.notify:
+        try:
+            if failed_jobs:
+                send_ntfy(
+                    message=(
+                        f"{input_directory.name}\n"
+                        f"{len(failed_jobs)}개 영상 압축 실패"
+                    ),
+                    title="cram 압축 실패",
+                    tags=["warning"],
+                    priority="high",
+                )
+            else:
+                send_ntfy(
+                    message=(
+                        f"{input_directory.name}\n"
+                        f"{len(jobs)}개 영상 압축 완료"
+                    ),
+                    title="cram 압축 완료",
+                    tags=["white_check_mark"],
+                )
+
+        except NtfyError as error:
+            print()
+            print(
+                f"Notification failed: {error}"
+            )
 
 
     elapsed_seconds = time.perf_counter() - benchmark_start
